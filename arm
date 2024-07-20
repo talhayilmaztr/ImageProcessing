@@ -1,0 +1,54 @@
+import time
+from pymavlink import mavutil
+
+# BAĞLANTILARI SAĞLIYORUZ
+def connect_to_pixhawk():
+    master = mavutil.mavlink_connection('/dev/ttyAMA0', baud=57600)
+    master.wait_heartbeat()
+    print("Connected to Pixhawk")
+    return master
+
+# ARMED MODUNA HAZIRLIYOR
+def ready_arm_mode(master):
+    print("Disabling arming checks...")
+    set_param(master, 'ARMING_CHECK', 0)
+    set_param(master, 'DISARM_DELAY', 127)
+
+# ARM MODUNA GEÇİYORUZ
+def go_arm_mode(master):
+    print("Arming the vehicle...")
+    master.arducopter_arm()
+    master.motors_armed_wait()
+    print("Vehicle armed")
+
+def set_param(master, param_id, param_value):
+    # Parametre ayarının başarılı olduğunu doğrulama
+    print(f"Setting {param_id} to {param_value}")
+    master.mav.param_set_send(
+        master.target_system,
+        master.target_component,
+        param_id.encode('utf-8'),
+        param_value,
+        mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+    )
+    time.sleep(1)  # Gecikme eklemek
+
+    # Parametre ayarının başarılı olduğunu doğrulama
+    while True:
+        param = master.recv_match(type='PARAM_VALUE', blocking=True)
+        if param.param_id.strip() == param_id:
+            if param.param_value == param_value:
+                print(f"{param_id} set to {param_value} successfully")
+            else:
+                print(f"Failed to set {param_id} to {param_value}")
+                raise Exception(f"Failed to set {param_id}")
+            break
+
+if __name__ == "__main__":
+    try:
+        master = connect_to_pixhawk()
+        ready_arm_mode(master)
+        time.sleep(5)
+        go_arm_mode(master)
+    except KeyboardInterrupt:
+        print("Interrupted by user")
