@@ -1,0 +1,124 @@
+import time
+from pymavlink import mavutil
+
+# Pixhawk'a bağlantı kurma
+def connect_to_pixhawk():
+    master = mavutil.mavlink_connection('/dev/ttyAMA0', baud=57600)
+    master.wait_heartbeat()
+    print("Pixhawk'a bağlanıldı")
+    return master
+
+# Arming moduna hazırlık
+def ready_arm_mode(master):
+    print("Arming kontrolleri devre dışı bırakılıyor...")
+    set_param(master, 'ARMING_CHECK', 0)
+    set_param(master, 'DISARM_DELAY', 127)
+
+# Arming moduna geçiş
+def go_arm_mode(master):
+    print("İHA arming moduna geçiriliyor...")
+    master.arducopter_arm()
+    master.motors_armed_wait()
+    print("İHA arming modunda")
+
+# Uçuş modunu değiştirme
+def set_mode(master, mode):
+    mode_id = master.mode_mapping()[mode]
+    master.set_mode(mode_id)
+    ack = False
+    while not ack:
+        ack_msg = master.recv_match(type='COMMAND_ACK', blocking=True)
+        ack_msg = ack_msg.to_dict()
+        if ack_msg['command'] == mavutil.mavlink.MAV_CMD_DO_SET_MODE:
+            ack = True
+    print(f"Uçuş modu {mode} olarak değiştirildi")
+
+# GPS üzerinden kalkış yapma
+def takeoff(master, target_altitude):
+    print(f"{target_altitude} metreye kalkış yapılıyor")
+    master.mav.command_long_send(
+        master.target_system, master.target_component,
+        mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0,
+        0, 0, 0, 0, 0, 0, target_altitude
+    )
+    time.sleep(10)  # Kalkış için süre
+
+# GPS üzerinden belirli bir konuma gitme
+def goto_position_target_global_int(master, lat, lon, alt):
+    print(f"GPS konumuna gidiliyor: Enlem: {lat}, Boylam: {lon}, Yükseklik: {alt}")
+    master.mav.set_position_target_global_int_send(
+        0, master.target_system, master.target_component,
+        mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT,
+        int(0b110111111000),  # Position type mask
+        lat, lon, alt,  # GPS enlem, boylam, yükseklik
+        0, 0, 0,  # x, y, z velocity
+        0, 0, 0,  # x, y, z acceleration (not used)
+        0, 0  # yaw, yaw rate (not used)
+    )
+    time.sleep(20)  # Hareket için süre
+
+# İniş yapma
+def land(master):
+    print("İHA iniş yapıyor...")
+    master.mav.command_long_send(
+        master.target_system,
+        master.target_component,
+        mavutil.mavlink.MAV_CMD_NAV_LAND,
+        0,
+        0, 0, 0, 0, 0, 0, 0
+    )
+    ack = False
+    while not ack:
+        ack_msg = master.recv_match(type='COMMAND_ACK', blocking=True)
+        ack_msg = ack_msg.to_dict()
+        if ack_msg['command'] == mavutil.mavlink.MAV_CMD_NAV_LAND and ack_msg['result'] == mavutil.mavlink.MAV_RESULT_ACCEPTED:
+            ack = True
+    print("Başarıyla inildi")
+
+# Parametre ayarlama
+def set_param(master, param_id, param_value):
+    print(f"{param_id} parametresi {param_value} olarak ayarlanıyor")
+    master.mav.param_set_send(
+        master.target_system,
+        master.target_component,
+        param_id.encode('utf-8'),
+        param_value,
+        mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+    )
+    time.sleep(1)
+
+    while True:
+        param = master.recv_match(type='PARAM_VALUE', blocking=True)
+        if param.param_id.strip() == param_id:
+            if param.param_value == param_value:
+                print(f"{param_id} parametresi başarıyla {param_value} olarak ayarlandı")
+            else:
+                print(f"{param_id} parametresi {param_value} olarak ayarlanamadı")
+                raise Exception(f"{param_id} parametresi ayarlanamadı")
+            break
+
+if __name__ == "__main__":
+    try:
+        master = connect_to_pixhawk()
+        ready_arm_mode(master)
+        time.sleep(5)
+        go_arm_mode(master)
+        set_mode(master, 'GUIDED')
+        takeoff(master, 7)  # 7 metreye kalkış
+        time.sleep(5)  # 5 saniye bekle
+        
+        # Mevcut GPS konumunu al
+        gps_msg = master.recv_match(type='GLOBAL_POSITION_INT', blocking=True)
+        current_lat = gps_msg.lat / 1e7  # Enlem
+        current_lon = gps_msg.lon / 1e7  # Boylam
+
+        # 3 metre ileri gitmek için GPS koordinatlarını hesapla
+        target_lat = current_lat + (3 / 111139)  # 3 metre ileri gitmek için enlem değişimi
+        target_lon = current_lon  # Boylam değişmeden kalır
+
+        goto_position_target_global_int(master, target_lat, target_lon, 7)  # 7 metre yükseklikte 3 metre ileri hareket
+        time.sleep(5)  # 5 saniye bekle
+
+        land(master)
+    except KeyboardInterrupt:
+        print("Kullanıcı tarafından kesildi")
