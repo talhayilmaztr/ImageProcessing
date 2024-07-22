@@ -1,0 +1,288 @@
+import time
+import cv2
+import numpy as np
+from pymavlink import mavutil
+from picamera2 import Picamera2, Preview
+from picamera2.encoders import H264Encoder
+
+# Sabitler
+k_p = 0.1  # P kontrol kazancı (gerektiğinde ayarlanabilir)
+frame_center_x = 640 / 2  # Çerçeve merkezinin x koordinatı (çözünürlüğe göre ayarlayın)
+frame_center_y = 480 / 2  # Çerçeve merkezinin y koordinatı (çözünürlüğe göre ayarlayın)
+
+# Pixhawk'a bağlantı sağlıyoruz
+def connect_to_pixhawk():
+    try:
+        master = mavutil.mavlink_connection('/dev/ttyAMA0', baud=57600)
+        master.wait_heartbeat()
+        print("Connected to Pixhawk")
+        return master
+    except Exception as e:
+        print(f"Failed to connect to Pixhawk: {e}")
+        raise
+
+# Armed moduna hazırlık yapıyoruz
+def ready_arm_mode(master):
+    try:
+        print("Disabling arming checks...")
+        set_param(master, 'ARMING_CHECK', 0)
+        set_param(master, 'DISARM_DELAY', 127)
+    except Exception as e:
+        print(f"Failed to prepare for arming: {e}")
+        raise
+
+# Arming işlemini gerçekleştiriyoruz
+def go_arm_mode(master):
+    try:
+        print("Arming the vehicle...")
+        master.arducopter_arm()
+        master.motors_armed_wait()
+        print("Vehicle armed")
+    except Exception as e:
+        print(f"Failed to arm the vehicle: {e}")
+        raise
+
+# Parametre ayarlama işlemi
+def set_param(master, param_id, param_value):
+    try:
+        print(f"Setting {param_id} to {param_value}")
+        master.mav.param_set_send(
+            master.target_system,
+            master.target_component,
+            param_id.encode('utf-8'),
+            param_value,
+            mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+        )
+        time.sleep(1)  # Gecikme eklemek
+
+        while True:
+            param = master.recv_match(type='PARAM_VALUE', blocking=True)
+            if param.param_id.strip() == param_id:
+                if param.param_value == param_value:
+                    print(f"{param_id} set to {param_value} successfully")
+                else:
+                    print(f"Failed to set {param_id} to {param_value}")
+                    raise Exception(f"Failed to set {param_id}")
+                break
+    except Exception as e:
+        print(f"Failed to set parameter {param_id}: {e}")
+        raise
+
+# Uçuş modunu değiştirme
+def set_mode(master, mode):
+    try:
+        mode_id = master.mode_mapping()[mode]
+        master.set_mode(mode_id)
+        ack = False
+        while not ack:
+            ack_msg = master.recv_match(type='COMMAND_ACK', blocking=True)
+            ack_msg = ack_msg.to_dict()
+            if ack_msg['command'] == mavutil.mavlink.MAV_CMD_DO_SET_MODE:
+                ack = True
+        print(f"Uçuş modu {mode} olarak değiştirildi")
+    except Exception as e:
+        print(f"Failed to set mode: {e}")
+        raise
+
+# Kalkış işlemi
+def takeoff(master, target_altitude):
+    try:
+        print(f"Taking off to {target_altitude} meters...")
+        master.mav.command_long_send(
+            master.target_system, master.target_component,
+            mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0,
+            0, 0, 0, 0, 0, 0, target_altitude
+        )
+        ack = False
+        while not ack:
+            ack_msg = master.recv_match(type='COMMAND_ACK', blocking=True)
+            ack_msg = ack_msg.to_dict()
+            if ack_msg['command'] == mavutil.mavlink.MAV_CMD_NAV_TAKEOFF and ack_msg['result'] == mavutil.mavlink.MAV_RESULT_ACCEPTED:
+                ack = True
+        print(f"{target_altitude} metreye ulaşıldı")
+        time.sleep(10)  # Kalkış ve stabilize olma süresi
+    except Exception as e:
+        print(f"Failed to take off: {e}")
+        raise
+
+# İniş işlemi
+def land(master):
+    try:
+        print("Landing...")
+        master.mav.command_long_send(
+            master.target_system, master.target_component,
+            mavutil.mavlink.MAV_CMD_NAV_LAND, 0,
+            0, 0, 0, 0, 0, 0, 0
+        )
+        print("Descending and landing")
+    except Exception as e:
+        print(f"Failed to land: {e}")
+        raise
+
+# Belirli bir yöne hareket etme ve sapmaları düzeltme
+def move_towards_target(master, vx, vy, vz):
+    try:
+        print(f"Moving in direction: vx={vx}, vy={vy}, vz={vz}")
+        master.mav.set_position_target_local_ned_send(
+            0,  # Timestamp (not used)
+            master.target_system, master.target_component,
+            mavutil.mavlink.MAV_FRAME_BODY_NED,
+            int(0b110111000111),  # Control velocities
+            0, 0, 0,  # Positions (not used)
+            vx, vy, vz,  # Velocities in m/s
+            0, 0, 0,  # Accelerations (not used)
+            0, 0  # Yaw and yaw rate (not used)
+        )
+    except Exception as e:
+        print(f"Failed to move towards target: {e}")
+        raise
+
+# Optik akış hesaplaması
+def calculate_optical_flow(prev_gray, gray):
+    flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+    avg_flow_x = np.mean(flow[..., 0])
+    avg_flow_y = np.mean(flow[..., 1])
+    return avg_flow_x, avg_flow_y
+
+# Görüntü işleme kodları
+def apply_morphology(mask):
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    mask = cv2.erode(mask, kernel, iterations=1)
+    mask = cv2.dilate(mask, kernel, iterations=2)
+    return mask
+
+def colorProcess(frame):
+    red_centers = []
+
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    lower_red = np.array([0, 100, 100])
+    upper_red = np.array([10, 255, 255])
+    red_lower2 = np.array([160, 100, 100])
+    red_upper2 = np.array([179, 255, 255])
+
+    mask1 = cv2.inRange(hsv, lower_red, upper_red)
+    mask2 = cv2.inRange(hsv, red_lower2, red_upper2)
+    mask = mask1 | mask2
+
+    mask = apply_morphology(mask)
+    contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area > 1940:  # Kontur alanını daha küçük nesneleri de algılayacak şekilde düşürdük
+            hull = cv2.convexHull(cnt)
+            hull_area = cv2.contourArea(hull)
+            solidity = float(area) / hull_area if hull_area > 0 else 0
+            perimeter = cv2.arcLength(cnt, True)
+            approx = cv2.approxPolyDP(cnt, 0.08 * perimeter, True)  # Hata payını artırdık
+            if len(approx) == 4 and solidity > 0.8:
+                x, y, w, h = cv2.boundingRect(cnt)
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 3)
+                center = (x + w / 2, y + h / 2)
+                red_centers.append((center[0], center[1], w, h))
+
+    return red_centers, frame
+
+# Video kaydını başlatma ve durdurma
+def start_video_recording(camera, file_path):
+    encoder = H264Encoder()
+    camera.start_recording(encoder, file_path)
+    print(f"Video kaydı başlatıldı: {file_path}")
+
+def stop_video_recording(camera):
+    camera.stop_recording()
+    print("Video kaydı durduruldu")
+
+if __name__ == "__main__":
+    try:
+        # Pixhawk bağlantısı
+        master = connect_to_pixhawk()
+        
+        # Kamera yapılandırması
+        camera = Picamera2()
+        video_file_path = '/home/bergusi/Desktop/flight_video.h264'
+        config = camera.create_video_configuration(main={"size": (640, 480)}, controls={"FrameRate": 15})
+        camera.configure(config)
+        camera.start_preview(Preview.QTGL)
+        
+        # Video kaydını başlat
+        start_video_recording(camera, video_file_path)
+        
+        # Uçuş işlemleri
+        ready_arm_mode(master)
+        time.sleep(5)
+        go_arm_mode(master)
+        set_mode(master, 'GUIDED')
+        takeoff(master, 7)  # 7 metre yüksekliğe kalkış
+        time.sleep(5)  # Kalkış sonrası stabilize olması için bekleme süresi
+
+        # OpenCV VideoCapture ile video kaynağı açma
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            print("Error: Could not open video stream.")
+            exit()
+
+        frame_count = 0  # Kaydedilen kare sayacı
+
+        # Optical Flow için ön hazırlık
+        prev_gray = None
+
+        start_time = time.time()
+
+        while cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                break
+
+            red_centers, processed_frame = colorProcess(frame)
+
+            if len(red_centers) > 0:
+                current_x, current_y, _, _ = red_centers[0]
+                error_x = frame_center_x - current_x
+                error_y = frame_center_y - current_y
+
+                vx = k_p * error_x
+                vy = k_p * error_y
+
+                move_towards_target(master, vx, vy, 0)
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if prev_gray is not None:
+                avg_flow_x, avg_flow_y = calculate_optical_flow(prev_gray, gray)
+
+                if np.abs(avg_flow_x) > 0.1 or np.abs(avg_flow_y) > 0.1:
+                    vx -= avg_flow_x * k_p
+                    vy -= avg_flow_y * k_p
+                    move_towards_target(master, vx, vy, 0)
+
+            prev_gray = gray
+
+            cv2.imshow('Processed Frame', processed_frame)
+
+            frame_filename = f"frame_{frame_count:04d}.jpg"
+            cv2.imwrite(frame_filename, processed_frame)  # Görüntüyü dosyaya kaydet
+            frame_count += 1  # Kare sayacını artır
+
+            if time.time() - start_time > 60:
+                land(master)
+                break
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+        cap.release()
+        cv2.destroyAllWindows()
+
+        # Video kaydını durdur
+        stop_video_recording(camera)
+        camera.stop_preview()
+        camera.close()
+
+    except KeyboardInterrupt:
+        print("Interrupted by user")
+        stop_video_recording(camera)
+        camera.stop_preview()
+        camera.close()
+    except Exception as e:
+        print(f"An error occurred: {e}")
