@@ -1,0 +1,196 @@
+import time
+import cv2
+import numpy as np
+from pymavlink import mavutil
+from picamera2 import Picamera2, Preview
+from picamera2.encoders import H264Encoder
+
+# PID kontrol parametreleri
+k_p = 0.1
+k_i = 0.01
+k_d = 0.01
+
+# Pixhawk'a bağlantı kurma
+def connect_to_pixhawk():
+    master = mavutil.mavlink_connection('/dev/ttyAMA0', baud=57600)
+    master.wait_heartbeat()
+    print("Pixhawk'a bağlanıldı")
+    return master
+
+# Arming moduna hazırlık
+def ready_arm_mode(master):
+    print("Arming kontrolleri devre dışı bırakılıyor...")
+    set_param(master, 'ARMING_CHECK', 0)
+    set_param(master, 'DISARM_DELAY', 127)
+
+# Arming moduna geçiş
+def go_arm_mode(master):
+    print("İHA arming moduna geçiriliyor...")
+    master.arducopter_arm()
+    master.motors_armed_wait()
+    print("İHA arming modunda")
+
+# Uçuş modunu değiştirme
+def set_mode(master, mode):
+    mode_id = master.mode_mapping()[mode]
+    master.set_mode(mode_id)
+    ack = False
+    while not ack:
+        ack_msg = master.recv_match(type='COMMAND_ACK', blocking=True)
+        ack_msg = ack_msg.to_dict()
+        if ack_msg['command'] == mavutil.mavlink.MAV_CMD_DO_SET_MODE:
+            ack = True
+    print(f"Uçuş modu {mode} olarak değiştirildi")
+
+# Kalkış yapma
+def takeoff(master, target_altitude):
+    print(f"{target_altitude} metreye kalkış yapılıyor")
+    master.mav.command_long_send(
+        master.target_system,
+        master.target_component,
+        mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+        0,
+        0, 0, 0, 0, 0, 0, target_altitude
+    )
+    ack = False
+    while not ack:
+        ack_msg = master.recv_match(type='COMMAND_ACK', blocking=True)
+        ack_msg = ack_msg.to_dict()
+        if ack_msg['command'] == mavutil.mavlink.MAV_CMD_NAV_TAKEOFF and ack_msg['result'] == mavutil.mavlink.MAV_RESULT_ACCEPTED:
+            ack = True
+    print(f"{target_altitude} metreye ulaşıldı")
+
+# İniş yapma
+def land(master):
+    print("İHA iniş yapıyor...")
+    master.mav.command_long_send(
+        master.target_system,
+        master.target_component,
+        mavutil.mavlink.MAV_CMD_NAV_LAND,
+        0,
+        0, 0, 0, 0, 0, 0, 0
+    )
+    ack = False
+    while not ack:
+        ack_msg = master.recv_match(type='COMMAND_ACK', blocking=True)
+        ack_msg = ack_msg.to_dict()
+        if ack_msg['command'] == mavutil.mavlink.MAV_CMD_NAV_LAND and ack_msg['result'] == mavutil.mavlink.MAV_RESULT_ACCEPTED:
+            ack = True
+    print("Başarıyla inildi")
+
+# Parametre ayarlama
+def set_param(master, param_id, param_value):
+    print(f"{param_id} parametresi {param_value} olarak ayarlanıyor")
+    master.mav.param_set_send(
+        master.target_system,
+        master.target_component,
+        param_id.encode('utf-8'),
+        param_value,
+        mavutil.mavlink.MAV_PARAM_TYPE_REAL32
+    )
+    time.sleep(1)
+
+    while True:
+        param = master.recv_match(type='PARAM_VALUE', blocking=True)
+        if param.param_id.strip() == param_id:
+            if param.param_value == param_value:
+                print(f"{param_id} parametresi başarıyla {param_value} olarak ayarlandı")
+            else:
+                print(f"{param_id} parametresi {param_value} olarak ayarlanamadı")
+                raise Exception(f"{param_id} parametresi ayarlanamadı")
+            break
+
+def get_imu_and_barometer_data(master):
+    """
+    IMU ve barometre verilerini çekmek için fonksiyon.
+    """
+    attitude_msg = master.recv_match(type='ATTITUDE', blocking=True)
+    altitude_msg = master.recv_match(type='GLOBAL_POSITION_INT', blocking=True)
+    
+    roll = attitude_msg.roll
+    pitch = attitude_msg.pitch
+    yaw = attitude_msg.yaw
+    altitude = altitude_msg.relative_alt / 1000.0  # metre cinsinden
+    
+    return roll, pitch, yaw, altitude
+
+def pid_control(target, current, integral, previous_error, kp, ki, kd):
+    """
+    PID kontrolcüsü.
+    """
+    error = target - current
+    integral += error
+    derivative = error - previous_error
+    output = kp * error + ki * integral + kd * derivative
+    return output, integral, error
+
+if __name__ == "__main__":
+    try:
+        # Pixhawk bağlantısı
+        master = connect_to_pixhawk()
+        
+        # Kamera yapılandırması
+        camera = Picamera2()
+        video_file_path = '/home/bergusi/Desktop/flight_video.h264'
+        config = camera.create_video_configuration(main={"size": (640, 480)}, controls={"FrameRate": 30})
+        camera.configure(config)
+        camera.start_preview(Preview.QTGL)
+        
+        # Video kaydını başlat
+        start_video_recording(camera, video_file_path)
+        
+        # Uçuş işlemleri
+        ready_arm_mode(master)
+        time.sleep(5)
+        go_arm_mode(master)
+        set_mode(master, 'GUIDED')
+        takeoff(master, 7)
+        time.sleep(5)  # Kalkış sonrası stabilize olması için bekleme süresi
+
+        # GPS bağlantısını kes
+        set_param(master, 'EKF_GPS_TYPE', 3)
+        time.sleep(2)
+
+        # PID kontrol için değişkenler
+        integral_alt = 0
+        previous_error_alt = 0
+        target_altitude = 7
+
+        while True:
+            roll, pitch, yaw, altitude = get_imu_and_barometer_data(master)  # IMU ve barometre verilerini çek
+            print(f"Roll: {roll}, Pitch: {pitch}, Yaw: {yaw}, Altitude: {altitude}")
+            
+            # Yükseklik kontrolü
+            output_alt, integral_alt, previous_error_alt = pid_control(target_altitude, altitude, integral_alt, previous_error_alt, k_p, k_i, k_d)
+            
+            # Diğer eksenlerdeki kontrol (roll ve pitch) buraya eklenebilir
+            
+            master.mav.set_position_target_local_ned_send(
+                0,
+                master.target_system, master.target_component,
+                mavutil.mavlink.MAV_FRAME_LOCAL_NED,
+                int(0b110111111000),  # Control flags
+                0, 0, -output_alt,  # Position
+                0, 0, 0,  # Velocity
+                0, 0, 0,  # Acceleration/Force
+                0, 0  # Yaw, Yaw rate
+            )
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):  # Eğer 'q' tuşuna basılırsa
+                break
+
+        # Video kaydını durdur
+        stop_video_recording(camera)
+        camera.stop_preview()
+        camera.close()
+
+        # İniş yap
+        land(master)
+
+    except KeyboardInterrupt:
+        print("Interrupted by user")
+        stop_video_recording(camera)
+        camera.stop_preview()
+        camera.close()
+    except Exception as e:
+        print(f"An error occurred: {e}")

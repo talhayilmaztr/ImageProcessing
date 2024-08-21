@@ -1,0 +1,264 @@
+# Drone gps ile 7 metre kalkış yapar 5 sn stabilize olduktan sonra gps bağlantısı kesilir ve görüntü işleme kodları ile kırmızı kutunun merkezini hesaplayıp kendini ona göre hizalamaya çalışır.
+
+import time  # Zaman ile ilgili işlemler için time kütüphanesini import ediyoruz
+import cv2  # OpenCV kütüphanesini import ediyoruz
+import numpy as np  # NumPy kütüphanesini import ediyoruz
+from pymavlink import mavutil  # pymavlink kütüphanesinden mavutil modülünü import ediyoruz
+from picamera2 import Picamera2, Preview  # picamera2 kütüphanesinden Picamera2 ve Preview modüllerini import ediyoruz
+from picamera2.encoders import H264Encoder  # picamera2 encoders modülünden H264Encoder'ı import ediyoruz
+
+# Sabitler
+k_p = 0.1  # P kontrol kazancı (gerektiğinde ayarlanabilir)
+frame_center_x = 640 / 2  # Çerçeve merkezinin x koordinatı (çözünürlüğe göre ayarlayın)
+frame_center_y = 480 / 2  # Çerçeve merkezinin y koordinatı (çözünürlüğe göre ayarlayın)
+
+def connect_to_pixhawk():
+    """
+    Pixhawk'a bağlantı kurar.
+    """
+    master = mavutil.mavlink_connection('/dev/ttyAMA0', baud=57600)  # Pixhawk'a bağlantı kurar, seri portu ve baud rate belirler
+    master.wait_heartbeat()  # Pixhawk'ın kalp atışını bekler
+    print("Pixhawk'a bağlanıldı")  # Bağlantı başarılı mesajını yazdırır
+    return master  # Bağlantıyı döner
+
+def ready_arm_mode(master):
+    """
+    Arming kontrollerini devre dışı bırakır ve arming moduna hazırlık yapar.
+    """
+    print("Arming kontrolleri devre dışı bırakılıyor...")  # Hazırlık mesajını yazdırır
+    set_param(master, 'ARMING_CHECK', 0)  # Arming kontrollerini devre dışı bırakır
+    set_param(master, 'DISARM_DELAY', 127)  # Disarm gecikmesini ayarlar
+
+def go_arm_mode(master):
+    """
+    İHA'yı arming moduna geçirir.
+    """
+    print("İHA arming moduna geçiriliyor...")  # Arming moduna geçiş mesajını yazdırır
+    master.arducopter_arm()  # İHA'yı arming moduna geçirir
+    master.motors_armed_wait()  # Motorların arming olmasını bekler
+    print("İHA arming modunda")  # Arming başarılı mesajını yazdırır
+
+def set_mode(master, mode):
+    """
+    İHA'nın uçuş modunu değiştirir.
+    """
+    mode_id = master.mode_mapping()[mode]  # Verilen modun ID'sini alır
+    master.set_mode(mode_id)  # Uçuş modunu değiştirir
+    ack = False  # Acknowledgement kontrolü için değişken
+    while not ack:  # Acknowledgement bekler
+        ack_msg = master.recv_match(type='COMMAND_ACK', blocking=True)  # ACK mesajını alır
+        ack_msg = ack_msg.to_dict()  # Mesajı sözlüğe çevirir
+        if ack_msg['command'] == mavutil.mavlink.MAV_CMD_DO_SET_MODE:  # Eğer komut set mode ise
+            ack = True  # ACK alındı olarak işaretler
+    print(f"Uçuş modu {mode} olarak değiştirildi")  # Başarı mesajını yazdırır
+
+def takeoff(master, target_altitude):
+    """
+    İHA'nın belirli bir yüksekliğe kalkış yapmasını sağlar.
+    """
+    print(f"{target_altitude} metreye kalkış yapılıyor")  # Kalkış mesajını yazdırır
+    master.mav.command_long_send(
+        master.target_system,  # Hedef sistem
+        master.target_component,  # Hedef bileşen
+        mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,  # Kalkış komutu
+        0,  # Confirmation
+        0, 0, 0, 0, 0, 0, target_altitude  # Kalkış parametreleri
+    )
+    ack = False  # Acknowledgement kontrolü için değişken
+    while not ack:  # Acknowledgement bekler
+        ack_msg = master.recv_match(type='COMMAND_ACK', blocking=True)  # ACK mesajını alır
+        ack_msg = ack_msg.to_dict()  # Mesajı sözlüğe çevirir
+        if ack_msg['command'] == mavutil.mavlink.MAV_CMD_NAV_TAKEOFF and ack_msg['result'] == mavutil.mavlink.MAV_RESULT_ACCEPTED:  # Eğer komut kalkış ve kabul edildiyse
+            ack = True  # ACK alındı olarak işaretler
+    print(f"{target_altitude} metreye ulaşıldı")  # Başarı mesajını yazdırır
+
+def land(master):
+    """
+    İHA'nın iniş yapmasını sağlar.
+    """
+    print("İHA iniş yapıyor...")  # İniş mesajını yazdırır
+    master.mav.command_long_send(
+        master.target_system,  # Hedef sistem
+        master.target_component,  # Hedef bileşen
+        mavutil.mavlink.MAV_CMD_NAV_LAND,  # İniş komutu
+        0,  # Confirmation
+        0, 0, 0, 0, 0, 0, 0  # İniş parametreleri
+    )
+    ack = False  # Acknowledgement kontrolü için değişken
+    while not ack:  # Acknowledgement bekler
+        ack_msg = master.recv_match(type='COMMAND_ACK', blocking=True)  # ACK mesajını alır
+        ack_msg = ack_msg.to_dict()  # Mesajı sözlüğe çevirir
+        if ack_msg['command'] == mavutil.mavlink.MAV_CMD_NAV_LAND and ack_msg['result'] == mavutil.mavlink.MAV_RESULT_ACCEPTED:  # Eğer komut iniş ve kabul edildiyse
+            ack = True  # ACK alındı olarak işaretler
+    print("Başarıyla inildi")  # Başarı mesajını yazdırır
+
+def set_param(master, param_id, param_value):
+    """
+    Belirli bir parametreyi istenen değere ayarlar.
+    """
+    print(f"{param_id} parametresi {param_value} olarak ayarlanıyor")  # Parametre ayar mesajını yazdırır
+    master.mav.param_set_send(
+        master.target_system,  # Hedef sistem
+        master.target_component,  # Hedef bileşen
+        param_id.encode('utf-8'),  # Parametre ID'si
+        param_value,  # Parametre değeri
+        mavutil.mavlink.MAV_PARAM_TYPE_REAL32  # Parametre tipi
+    )
+    time.sleep(1)  # Bekleme süresi
+
+    while True:  # Parametre ayarını kontrol etmek için döngü
+        param = master.recv_match(type='PARAM_VALUE', blocking=True)  # Parametre değerini alır
+        if param.param_id.strip() == param_id:  # Eğer parametre ID'si doğruysa
+            if param.param_value == param_value:  # Eğer parametre değeri doğruysa
+                print(f"{param_id} parametresi başarıyla {param_value} olarak ayarlandı")  # Başarı mesajını yazdırır
+            else:
+                print(f"{param_id} parametresi {param_value} olarak ayarlanamadı")  # Hata mesajını yazdırır
+                raise Exception(f"{param_id} parametresi ayarlanamadı")  # Hata fırlatır
+            break  # Döngüden çıkar
+
+def calculate_optical_flow(prev_gray, gray):
+    """
+    İki ardışık görüntü arasındaki optik akışı hesaplar.
+    """
+    flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)  # Optik akışı hesaplar
+    avg_flow_x = np.mean(flow[..., 0])  # X yönündeki ortalama akışı hesaplar
+    avg_flow_y = np.mean(flow[..., 1])  # Y yönündeki ortalama akışı hesaplar
+    return avg_flow_x, avg_flow_y  # Ortalama akış değerlerini döner
+
+def apply_morphology(mask):
+    """
+    Görüntü üzerindeki maskeye morfolojik işlemler uygular.
+    """
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))  # Morfolojik işlem için çekirdek oluşturur
+    mask = cv2.erode(mask, kernel, iterations=1)  # Maskeyi erozyona uğratır
+    mask = cv2.dilate(mask, kernel, iterations=2)  # Maskeyi genişletir
+    return mask  # İşlenmiş maskeyi döner
+
+def colorProcess(frame):
+    """
+    Kırmızı renkli objeleri tespit eder ve çerçeve üzerindeki koordinatlarını döner.
+    """
+    red_centers = []  # Kırmızı merkezler için liste
+
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)  # Çerçeveyi HSV renk uzayına dönüştürür
+
+    lower_red = np.array([0, 100, 100])  # Kırmızı alt sınır
+    upper_red = np.array([10, 255, 255])  # Kırmızı üst sınır
+    red_lower2 = np.array([160, 100, 100])  # Kırmızı alt sınır (ikinci aralık)
+    red_upper2 = np.array([179, 255, 255])  # Kırmızı üst sınır (ikinci aralık)
+
+    mask1 = cv2.inRange(hsv, lower_red, upper_red)  # İlk kırmızı aralık için maske
+    mask2 = cv2.inRange(hsv, red_lower2, red_upper2)  # İkinci kırmızı aralık için maske
+    mask = mask1 | mask2  # Maskeleri birleştirir
+
+    mask = apply_morphology(mask)  # Morfolojik işlemler uygular
+    contours, _ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)  # Konturları bulur
+
+    for cnt in contours:  # Her kontur için
+        area = cv2.contourArea(cnt)  # Kontur alanını hesaplar
+        if area > 1940:  # Alanın yeterince büyük olup olmadığını kontrol eder
+            hull = cv2.convexHull(cnt)  # Konveks kılıfı hesaplar
+            hull_area = cv2.contourArea(hull)  # Konveks kılıf alanını hesaplar
+            solidity = float(area) / hull_area if hull_area > 0 else 0  # Dolgunluk oranını hesaplar
+            perimeter = cv2.arcLength(cnt, True)  # Çevre uzunluğunu hesaplar
+            approx = cv2.approxPolyDP(cnt, 0.08 * perimeter, True)  # Yaklaşık poligon oluşturur
+            if len(approx) == 4 and solidity > 0.8:  # Eğer dört köşeli ve dolgunluk oranı yeterliyse
+                x, y, w, h = cv2.boundingRect(cnt)  # Çerçeve oluşturur
+                cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 3)  # Çerçeve üzerine çizim yapar
+                center = (x + w / 2, y + h / 2)  # Merkezi hesaplar
+                red_centers.append((center[0], center[1], w, h))  # Merkezi listeye ekler
+
+    return red_centers, frame  # Kırmızı merkezleri ve işlenmiş çerçeveyi döner
+
+def start_video_recording(camera, file_path):
+    """
+    Kameradan video kaydını başlatır.
+    """
+    encoder = H264Encoder()  # H264 encoder oluşturur
+    camera.start_recording(encoder, file_path)  # Video kaydını başlatır
+    print(f"Video kaydı başlatıldı: {file_path}")  # Başlangıç mesajını yazdırır
+
+def stop_video_recording(camera):
+    """
+    Kameradan video kaydını durdurur.
+    """
+    camera.stop_recording()  # Video kaydını durdurur
+    print("Video kaydı durduruldu")  # Durdurma mesajını yazdırır
+
+if __name__ == "__main__":
+    try:
+        # Pixhawk bağlantısı
+        master = connect_to_pixhawk()
+        
+        # Kamera yapılandırması
+        camera = Picamera2()
+        video_file_path = '/home/bergusi/Desktop/flight_video.h264'
+        config = camera.create_video_configuration(main={"size": (640, 480)}, controls={"FrameRate": 30})
+        camera.configure(config)
+        camera.start_preview(Preview.QTGL)
+        
+        # Video kaydını başlat
+        start_video_recording(camera, video_file_path)
+        
+        # Uçuş işlemleri
+        ready_arm_mode(master)
+        time.sleep(5)
+        go_arm_mode(master)
+        set_mode(master, 'GUIDED')
+        takeoff(master, 7)
+        time.sleep(5)  # Kalkış sonrası stabilize olması için bekleme süresi
+
+        # GPS bağlantısını kes
+        set_param(master, 'EKF_GPS_TYPE', 3)
+        time.sleep(2)
+
+        # OpenCV kullanarak PiCamera2'den görüntü alımı
+        prev_gray = None
+        start_time = time.time()
+
+        while True:
+            frame = camera.capture_array()  # PiCamera2'den görüntü alır
+            red_centers, processed_frame = colorProcess(frame)  # Kırmızı nesneleri tespit eder ve görüntüyü işler
+
+            if len(red_centers) > 0:  # Eğer kırmızı nesneler bulunursa
+                current_x, current_y, _, _ = red_centers[0]  # İlk nesnenin merkezini alır
+                error_x = frame_center_x - current_x  # X eksenindeki hatayı hesaplar
+                error_y = frame_center_y - current_y  # Y eksenindeki hatayı hesaplar
+
+                vx = k_p * error_x  # X ekseninde hız komutunu hesaplar
+                vy = k_p * error_y  # Y ekseninde hız komutunu hesaplar
+
+                move_towards_target(master, vx, vy, 0)  # İHA'yı hedefe doğru hareket ettirir
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)  # Görüntüyü gri tonlamaya dönüştürür
+            if prev_gray is not None:  # Eğer önceki görüntü varsa
+                avg_flow_x, avg_flow_y = calculate_optical_flow(prev_gray, gray)  # Optik akışı hesaplar
+
+                if np.abs(avg_flow_x) > 0.1 or np.abs(avg_flow_y) > 0.1:  # Eğer akış yeterince büyükse
+                    vx -= avg_flow_x * k_p  # X ekseninde hız düzeltmesi yapar
+                    vy -= avg_flow_y * k_p  # Y ekseninde hız düzeltmesi yapar
+                    move_towards_target(master, vx, vy, 0)  # İHA'yı düzeltir
+
+            prev_gray = gray  # Mevcut görüntüyü önceki görüntü olarak saklar
+
+            cv2.imshow('Processed Frame', processed_frame)  # İşlenmiş görüntüyü gösterir
+
+            if time.time() - start_time > 60:  # 60 saniye geçtiyse
+                land(master)  # İHA'yı indirir
+                break
+
+            if cv2.waitKey(1) & 0xFF == ord('q'):  # Eğer 'q' tuşuna basılırsa
+                break
+
+        # Video kaydını durdur
+        stop_video_recording(camera)
+        camera.stop_preview()
+        camera.close()
+
+    except KeyboardInterrupt:
+        print("Interrupted by user")  # Kullanıcı kesintisi mesajını yazdırır
+        stop_video_recording(camera)
+        camera.stop_preview()
+        camera.close()
+    except Exception as e:
+        print(f"An error occurred: {e}")  # Hata mesajını yazdırır
